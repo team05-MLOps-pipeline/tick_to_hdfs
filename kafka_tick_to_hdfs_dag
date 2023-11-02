@@ -1,0 +1,96 @@
+from airflow.operators.python_operator import PythonOperator
+from airflow import DAG
+import pyarrow as pa 
+from datetime import datetime, timedelta
+from confluent_kafka import Consumer, TopicPartition
+from hdfs import InsecureClient
+import json
+import pandas as pd
+import logging
+import pytz
+from pytz import utc
+
+# 로그 생성 및 설정
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(formatter)
+logger.addHandler(stream_handler)
+
+
+# DAG 설정
+default_args = {
+    'owner': 'kafka_tick_to_hdfs_dag',
+    'depends_on_past': False,
+    'start_date': datetime(2023, 10, 31, 0, 0, tzinfo=utc),
+    'retries': 3,
+    'retry_delay': timedelta(minutes=5),
+}
+
+dag = DAG('kafka_tick_to_hdfs_dag', 
+          default_args=default_args,
+          catchup=False, 
+          schedule_interval=timedelta(minutes=5),  
+          end_date=datetime(2023, 11, 30, 11, 30,tzinfo=utc))
+
+def tic_to_hdfs():
+    tp_name = "stock_5min_tick"
+    partition = 0 
+    tic_conf = {
+        'bootstrap.servers': '172.23.0.1:9092',
+        'group.id': 'stock',  
+        'auto.offset.reset': 'latest'
+    }
+
+    consumer = Consumer(tic_conf)
+    consumer.subscribe([tp_name])
+
+    # Hadoop 클라이언트 설정 (변경 없음)
+    hdfs_client = InsecureClient('http://172.23.0.1:9870', user='root')
+
+    utc_tz = pytz.timezone('UTC')
+
+    while True:
+        now = datetime.now(utc_tz)
+        if now >= dag.end_date:
+            break
+
+        file_name = now.strftime("%Y%m%d%H%M") + '.parquet'
+        data_to_save = []
+        topic = TopicPartition(tp_name, partition)
+        consumer.assign([topic])
+
+        # 5분 동안 메시지를 받는다.
+        end_time = now + timedelta(minutes=5)
+        while datetime.now(utc_tz) < end_time:
+            msg = consumer.poll(timeout=3)
+            if msg is None:
+                break
+            if msg.error():
+                pass
+            else:
+                value = json.loads(msg.value().decode('utf-8'))
+                data_to_save.append(value)
+        
+        if len(data_to_save) == 0:
+            break
+
+        # 받은 메시지를 HDFS에 저장한다.
+        df = pd.DataFrame(data_to_save)
+        table = pa.Table.from_pandas(df)
+        hdfs_path = '/stock_hdfs/' + file_name
+            
+        with hdfs_client.write(hdfs_path, overwrite=True) as writer:
+            writer.write(table.to_pandas().to_parquet())
+            print(f"Saved messages to HDFS")
+            
+        # 메시지를 받는 작업이 끝나면, consumer를 종료한다.
+        consumer.close()
+        break
+
+tic_to_hdfs_task = PythonOperator(
+   task_id='tic_to_hdfs_task',
+   python_callable=tic_to_hdfs,
+   dag=dag
+)
